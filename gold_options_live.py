@@ -6,6 +6,35 @@ Requires:
     pip install databento python-dotenv
 
 API key is loaded automatically from .env file in the same directory.
+
+Usage:
+    python gold_options_live.py [options]
+
+Options:
+    -y, --year YEAR      Expiry year (default: 2026)
+    -m, --month MONTH    Expiry month 1-12 (default: 3 for March)
+    -w, --week WEEK      Week number 1-5 for weekly options (omit for monthly)
+    -s, --strikes N [N]  Filter to specific strikes (e.g., --strikes 2700 2750)
+    -c, --calls          Show calls only
+    -p, --puts           Show puts only
+    -k, --api-key KEY    Databento API key (or set DATABENTO_API_KEY env var)
+    -d, --debug          Print raw incoming data for debugging
+
+Examples:
+    # March 2026 monthly options (default)
+    python gold_options_live.py
+
+    # June 2026 monthly options
+    python gold_options_live.py --year 2026 --month 6
+
+    # Week 1 weekly options for March 2026
+    python gold_options_live.py --week 1
+
+    # Only calls at strikes 2700 and 2800
+    python gold_options_live.py --calls --strikes 2700 2800
+
+    # Week 2 puts only
+    python gold_options_live.py --week 2 --puts
 """
 
 import os
