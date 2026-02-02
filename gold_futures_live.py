@@ -79,10 +79,10 @@ def run_live_feed(
 
     client = Live(key=api_key)
 
-    # Subscribe to best bid/offer (BBO) data
+    # Subscribe to best bid/offer (BBO) data sampled every second
     client.subscribe(
         dataset=DATASET,
-        schema="mbp-1",  # Top of book bid/ask
+        schema="bbo-1s",
         symbols=[symbol],
     )
 
