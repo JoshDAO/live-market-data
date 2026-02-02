@@ -109,11 +109,18 @@ type Config struct {
 type InstrumentDef struct {
 	RawSymbol  string `json:"raw_symbol"`
 	Underlying string `json:"underlying"`
+	Expiration string `json:"expiration"` // Unix timestamp as string (nanoseconds)
 }
 
-// fetchUnderlying fetches the underlying futures symbol for a specific option from Databento Historical API.
-// rawSymbol is the exact symbol from the live stream (e.g., "OG1G6 C2700").
-func fetchUnderlying(apiKey string, rawSymbol string, debug bool) (string, error) {
+// InstrumentInfo holds the underlying and expiration from the API
+type InstrumentInfo struct {
+	Underlying string
+	Expiration time.Time
+}
+
+// fetchInstrumentInfo fetches the underlying futures symbol and expiration date for a specific option
+// from Databento Historical API. rawSymbol is the exact symbol from the live stream (e.g., "OG1G6 C2700").
+func fetchInstrumentInfo(apiKey string, rawSymbol string, debug bool) (*InstrumentInfo, error) {
 	// Use yesterday's date to ensure data is available
 	startDate := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
 
@@ -128,128 +135,79 @@ func fetchUnderlying(apiKey string, rawSymbol string, debug bool) (string, error
 	reqURL := "https://hist.databento.com/v0/timeseries.get_range?" + params.Encode()
 
 	if debug {
-		fmt.Printf("DEBUG: Fetching underlying for %s from API\n", rawSymbol)
+		fmt.Printf("DEBUG: Fetching instrument info for %s from API\n", rawSymbol)
 	}
 
 	req, err := http.NewRequest("GET", reqURL, nil)
 	if err != nil {
-		return "", fmt.Errorf("failed to create request: %w", err)
+		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 	req.SetBasicAuth(apiKey, "")
 
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("failed to fetch definition: %w", err)
+		return nil, fmt.Errorf("failed to fetch definition: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Read and optionally print raw response for debugging
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+	if debug {
+		// Show first 500 chars of raw response
+		preview := string(body)
+		if len(preview) > 500 {
+			preview = preview[:500] + "..."
+		}
+		fmt.Printf("DEBUG: Raw API response: %s\n", preview)
 	}
 
 	// Parse first JSON line
-	decoder := json.NewDecoder(resp.Body)
+	decoder := json.NewDecoder(strings.NewReader(string(body)))
 	if decoder.More() {
 		var def InstrumentDef
 		if err := decoder.Decode(&def); err != nil {
-			return "", fmt.Errorf("failed to decode definition: %w", err)
+			return nil, fmt.Errorf("failed to decode definition: %w", err)
 		}
-		if def.Underlying != "" {
-			if debug {
-				fmt.Printf("DEBUG: API returned underlying: %s\n", def.Underlying)
+		if debug {
+			fmt.Printf("DEBUG: API response - underlying=%q, expiration=%q\n", def.Underlying, def.Expiration)
+		}
+		if def.Underlying == "" {
+			return nil, fmt.Errorf("no underlying found for %s", rawSymbol)
+		}
+
+		info := &InstrumentInfo{
+			Underlying: def.Underlying,
+		}
+
+		if def.Expiration != "" {
+			expVal, err := strconv.ParseUint(def.Expiration, 10, 64)
+			if err == nil && expVal > 0 {
+				// Databento uses nanoseconds since epoch
+				info.Expiration = time.Unix(0, int64(expVal))
+				if debug {
+					fmt.Printf("DEBUG: Parsed expiration: %s\n", info.Expiration.Format("2006-01-02 15:04:05"))
+				}
 			}
-			return def.Underlying, nil
 		}
+		return info, nil
 	}
 
-	return "", fmt.Errorf("no underlying found for %s", rawSymbol)
+	return nil, fmt.Errorf("no data returned for %s", rawSymbol)
 }
 
 func getExpiryCode(year, month int) string {
 	monthCode := MonthCodes[month]
 	yearCode := strconv.Itoa(year % 10) // Last digit
 	return monthCode + yearCode
-}
-
-func getExpirationDate(year, month, week int) time.Time {
-	if week > 0 {
-		// Weekly options expire on Friday of that week
-		firstDay := time.Date(year, time.Month(month), 1, 0, 0, 0, 0, time.UTC)
-		// Find first Friday (weekday 5)
-		daysUntilFriday := (5 - int(firstDay.Weekday()) + 7) % 7
-		if daysUntilFriday == 0 && firstDay.Weekday() != time.Friday {
-			daysUntilFriday = 7
-		}
-		firstFriday := firstDay.AddDate(0, 0, daysUntilFriday)
-		return firstFriday.AddDate(0, 0, (week-1)*7)
-	}
-
-	// Monthly options: 4th last business day of month prior to contract month
-	// (adjusted if Friday)
-	return getMonthlyOptionExpiry(year, month)
-}
-
-// getMonthlyOptionExpiry calculates when the monthly option for a cycle month expires.
-// Monthly options expire on the 4th last business day of the month prior to the contract month.
-// If the 4th last business day is a Friday or before a holiday, trading terminates on the prior business day.
-// Note: Holiday checking is not implemented; only the Friday rule is applied.
-func getMonthlyOptionExpiry(year, cycleMonth int) time.Time {
-	// The monthly option expires in the month before the cycle month
-	priorMonth := cycleMonth - 1
-	priorYear := year
-	if priorMonth < 1 {
-		priorMonth = 12
-		priorYear--
-	}
-
-	// Get last day of prior month
-	lastDay := time.Date(priorYear, time.Month(priorMonth)+1, 0, 0, 0, 0, 0, time.UTC)
-
-	// Count back 4 business days (skip weekends)
-	businessDays := 0
-	current := lastDay
-	for businessDays < 4 {
-		if current.Weekday() != time.Saturday && current.Weekday() != time.Sunday {
-			businessDays++
-		}
-		if businessDays < 4 {
-			current = current.AddDate(0, 0, -1)
-		}
-	}
-
-	// If it's a Friday, go to prior business day (Thursday)
-	if current.Weekday() == time.Friday {
-		current = current.AddDate(0, 0, -1)
-	}
-
-	return current
-}
-
-// Gold futures cycle months: G(Feb), J(Apr), M(Jun), Q(Aug), V(Oct), Z(Dec)
-var FuturesCycleMonths = []int{2, 4, 6, 8, 10, 12}
-
-// getUnderlyingFutures determines the correct underlying futures contract for an option.
-// The underlying is determined by which cycle window the option expiry falls into.
-// Options expiring on or before a cycle's monthly option expiry use that cycle's futures.
-// Options expiring after the cutoff roll to the next cycle.
-func getUnderlyingFutures(optionExpiry time.Time) string {
-	year := optionExpiry.Year()
-
-	// Check each cycle in order: G, J, M, Q, V, Z
-	// Cutoff is the 4th last business day of the month before (adjusted if Friday)
-	for _, cycleMonth := range FuturesCycleMonths {
-		cutoff := getMonthlyOptionExpiry(year, cycleMonth)
-
-		// Options expiring on or before cutoff use this cycle's futures
-		if optionExpiry.Before(cutoff) || optionExpiry.Equal(cutoff) {
-			return GoldFuturesRoot + getExpiryCode(year, cycleMonth)
-		}
-	}
-
-	// If past Z cutoff (late November), use G (February) of next year
-	return GoldFuturesRoot + getExpiryCode(year+1, 2)
 }
 
 func buildParentSymbol(week int) string {
@@ -377,8 +335,8 @@ func impliedVolatility(price, F, K, T, r float64, optionType string) *float64 {
 		if sigma <= 0.001 {
 			sigma = 0.001
 		}
-		if sigma > 5.0 {
-			return nil // IV unreasonably high
+		if sigma > 10.0 {
+			return nil // IV unreasonably high (>1000%)
 		}
 	}
 
@@ -405,11 +363,20 @@ func printTable(quotes map[string]*Quote, expiryDesc string, expirationDate time
 	fmt.Printf("Gold Options - %s\n", expiryDesc)
 	if futuresPrice != nil {
 		fmt.Printf("Futures (%s): $%.2f | ", underlyingSym, *futuresPrice)
-	} else {
+	} else if underlyingSym != "" {
 		fmt.Printf("Futures (%s): N/A | ", underlyingSym)
+	} else {
+		fmt.Print("Futures: Pending | ")
+	}
+
+	var expirationStr string
+	if expirationDate.IsZero() {
+		expirationStr = "Pending"
+	} else {
+		expirationStr = expirationDate.Format("Jan 02, 2006")
 	}
 	fmt.Printf("Expiration: %s | Updated: %s | %d instruments\n",
-		expirationDate.Format("Jan 02, 2006"),
+		expirationStr,
 		now.Format("15:04:05"),
 		len(quotes))
 	fmt.Println(strings.Repeat("-", 115))
@@ -606,24 +573,26 @@ func (v *RecordVisitor) processBidAsk(instrumentID uint32, level dbn.BidAskPair,
 	// Calculate time to expiration in years
 	T := v.expirationDate.Sub(time.Now()).Hours() / (24 * 365.25)
 
-	// Get the underlying futures symbol - fetch from API on first option, fallback to calculation
+	// Get the underlying and expiration from API on first option
 	if !v.underlyingSet {
 		v.underlyingSet = true
-		// Try to fetch from API using this exact symbol
-		if fetched, err := fetchUnderlying(v.cfg.APIKey, symbol, v.cfg.Debug); err == nil {
-			v.underlying = fetched
-			fmt.Printf("Underlying from API: %s\n", v.underlying)
-		} else {
-			// Fallback to calculation
-			v.underlying = getUnderlyingFutures(v.expirationDate)
-			if v.cfg.Debug {
-				fmt.Printf("DEBUG: API fetch failed (%v), using calculated underlying: %s\n", err, v.underlying)
-			} else {
-				fmt.Printf("Using calculated underlying: %s\n", v.underlying)
+		if info, err := fetchInstrumentInfo(v.cfg.APIKey, symbol, v.cfg.Debug); err == nil {
+			v.underlying = info.Underlying
+			if !info.Expiration.IsZero() {
+				v.expirationDate = info.Expiration
 			}
+			fmt.Printf("Underlying: %s | Expiration: %s\n", v.underlying, v.expirationDate.Format("Jan 02, 2006"))
+		} else {
+			fmt.Printf("Warning: Failed to get instrument info from API: %v\n", err)
+			fmt.Println("IV and delta will not be calculated.")
 		}
 	}
-	futuresPrice := v.futuresPrices[v.underlying]
+
+	// Skip IV/delta calculation if we don't have the underlying
+	var futuresPrice *float64
+	if v.underlying != "" {
+		futuresPrice = v.futuresPrices[v.underlying]
+	}
 
 	if v.cfg.Debug {
 		if v.underlying != "" && futuresPrice == nil {
@@ -697,24 +666,24 @@ func (v *RecordVisitor) processBidAsk(instrumentID uint32, level dbn.BidAskPair,
 
 // refreshDisplay updates the terminal display
 func (v *RecordVisitor) refreshDisplay() {
-	// Use the underlying (fetched from API or calculated)
-	underlying := v.underlying
-	if underlying == "" {
-		// Fallback if not yet determined (e.g., futures data arrives before options)
-		underlying = getUnderlyingFutures(v.expirationDate)
+	var futuresPrice *float64
+	if v.underlying != "" {
+		futuresPrice = v.futuresPrices[v.underlying]
 	}
-	futuresPrice := v.futuresPrices[underlying]
-	printTable(v.quotes, v.expiryDesc, v.expirationDate, underlying, futuresPrice)
+	printTable(v.quotes, v.expiryDesc, v.expirationDate, v.underlying, futuresPrice)
 }
 
 // recalculateGreeks updates IV and delta for all quotes when futures price changes
 func (v *RecordVisitor) recalculateGreeks() {
+	if v.underlying == "" {
+		return
+	}
+
 	T := v.expirationDate.Sub(time.Now()).Hours() / (24 * 365.25)
 	if T <= 0 {
 		return
 	}
 
-	// All options share the same underlying
 	futuresPrice := v.futuresPrices[v.underlying]
 	if futuresPrice == nil {
 		return
@@ -749,7 +718,6 @@ func (v *RecordVisitor) recalculateGreeks() {
 func runLiveFeed(cfg Config) error {
 	expiryCode := getExpiryCode(cfg.Year, cfg.Month)
 	parentSymbol := buildParentSymbol(cfg.Week)
-	expirationDate := getExpirationDate(cfg.Year, cfg.Month, cfg.Week)
 
 	var symbolPrefix, expiryDesc string
 	if cfg.Week > 0 {
@@ -830,13 +798,12 @@ func runLiveFeed(cfg Config) error {
 
 	// Create visitor for processing records
 	visitor := &RecordVisitor{
-		cfg:            cfg,
-		symbolPrefix:   symbolPrefix,
-		expiryDesc:     expiryDesc,
-		expirationDate: expirationDate,
-		quotes:         make(map[string]*Quote),
-		symbolMap:      make(map[uint32]string),
-		futuresPrices:  make(map[string]*float64),
+		cfg:           cfg,
+		symbolPrefix:  symbolPrefix,
+		expiryDesc:    expiryDesc,
+		quotes:        make(map[string]*Quote),
+		symbolMap:     make(map[uint32]string),
+		futuresPrices: make(map[string]*float64),
 	}
 
 	// Process records in goroutine
