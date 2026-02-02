@@ -304,35 +304,45 @@ func black76Delta(F, K, T, r, sigma float64, optionType string) float64 {
 	return -discount * normalCDF(-d1)
 }
 
-// impliedVolatility calculates IV using Newton-Raphson method
+// impliedVolatility calculates IV using Newton-Raphson method with step clamping
 func impliedVolatility(price, F, K, T, r float64, optionType string) *float64 {
 	if T <= 0 || price <= 0 {
 		return nil
 	}
 
-	// Initial guess
-	sigma := 0.3
-	const maxIter = 100
+	sigma := 0.5 // Initial guess
+	const maxIter = 200
 	const tolerance = 1e-6
 
 	for i := 0; i < maxIter; i++ {
 		calcPrice := black76Price(F, K, T, r, sigma, optionType)
 		vega := black76Vega(F, K, T, r, sigma)
 
-		if vega < 1e-10 {
-			// Vega too small, can't converge
-			return nil
-		}
-
 		diff := calcPrice - price
 		if math.Abs(diff) < tolerance {
 			return &sigma
 		}
 
-		sigma = sigma - diff/vega
+		if vega < 1e-10 {
+			// Vega too small for Newton-Raphson, nudge sigma toward the price
+			if diff < 0 {
+				sigma *= 1.5
+			} else {
+				sigma *= 0.5
+			}
+		} else {
+			step := diff / vega
+			// Clamp step size to prevent overshooting
+			if step > 0.5 {
+				step = 0.5
+			} else if step < -0.5 {
+				step = -0.5
+			}
+			sigma -= step
+		}
 
 		// Bounds check
-		if sigma <= 0.001 {
+		if sigma < 0.001 {
 			sigma = 0.001
 		}
 		if sigma > 10.0 {
