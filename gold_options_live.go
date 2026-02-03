@@ -156,22 +156,8 @@ func fetchInstrumentInfo(apiKey string, rawSymbol string, debug bool) (*Instrume
 		return nil, fmt.Errorf("API returned status %d: %s", resp.StatusCode, string(body))
 	}
 
-	// Read and optionally print raw response for debugging
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
-	}
-	if debug {
-		// Show first 500 chars of raw response
-		preview := string(body)
-		if len(preview) > 500 {
-			preview = preview[:500] + "..."
-		}
-		fmt.Printf("DEBUG: Raw API response: %s\n", preview)
-	}
-
 	// Parse first JSON line
-	decoder := json.NewDecoder(strings.NewReader(string(body)))
+	decoder := json.NewDecoder(resp.Body)
 	if decoder.More() {
 		var def InstrumentDef
 		if err := decoder.Decode(&def); err != nil {
